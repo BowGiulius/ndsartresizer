@@ -5,7 +5,34 @@ import { UploadCloud, Download, Image as ImageIcon, FileWarning, Loader2, File a
 import * as fflate from 'fflate';
 
 import NextImage from 'next/image';
-import { extractIdFromNDS } from '@/lib/utils';
+import { extractIdFromNDS, getGameCoverUrl, getRegionFromId } from '@/lib/utils';
+
+let cachedDbLines: string[] | null = null;
+let fetchingDbPromise: Promise<string[]> | null = null;
+
+const fetchAllDbLines = async (): Promise<string[]> => {
+  if (cachedDbLines) return cachedDbLines;
+  if (fetchingDbPromise) return fetchingDbPromise;
+  
+  fetchingDbPromise = (async () => {
+    const dbsToFetch = ['IT', 'EN', 'US', 'FR', 'ES', 'DE'];
+    let allLines: string[] = [];
+    await Promise.all(dbsToFetch.map(async (langCode) => {
+      try {
+        const res = await fetch(`/dstdb_${langCode}.txt`);
+        if (res.ok) {
+          const text = await res.text();
+          allLines = allLines.concat(text.split('\n'));
+        }
+      } catch (e) {
+        // ignore
+      }
+    }));
+    cachedDbLines = allLines;
+    return allLines;
+  })();
+  return fetchingDbPromise;
+};
 
 const content = {
   IT: {
@@ -156,20 +183,7 @@ export default function Home() {
     const delayDebounceFn = setTimeout(async () => {
       setIsSearchingList(true);
       try {
-        const dbsToFetch = ['IT', 'EN', 'US', 'FR', 'ES', 'DE'];
-        let allLines: string[] = [];
-        
-        for (const langCode of dbsToFetch) {
-            try {
-                const res = await fetch(`/dstdb_${langCode}.txt`);
-                if (res.ok) {
-                    const text = await res.text();
-                    allLines = allLines.concat(text.split('\n'));
-                }
-            } catch (e) {
-                // ignore
-            }
-        }
+        const allLines = await fetchAllDbLines();
         
         if (allLines.length > 0) {
           const results: {id: string, title: string}[] = [];
@@ -267,40 +281,27 @@ export default function Home() {
       console.warn("Local cover not found or error checking local cover:", e);
     }
 
-    let defaultRegion = 'EN';
-    if (code.endsWith('E')) defaultRegion = 'US';
-    else if (code.endsWith('P') || code.endsWith('X') || code.endsWith('Y') || code.endsWith('Z')) defaultRegion = 'EN';
-    else if (code.endsWith('J')) defaultRegion = 'JA';
-    else if (code.endsWith('I')) defaultRegion = 'IT';
-    else if (code.endsWith('F')) defaultRegion = 'FR';
-    else if (code.endsWith('S')) defaultRegion = 'ES';
-    else if (code.endsWith('D')) defaultRegion = 'DE';
-    else if (code.endsWith('K')) defaultRegion = 'KO';
-    else if (code.endsWith('U')) defaultRegion = 'AU';
-    else if (code.endsWith('H')) defaultRegion = 'NL';
+    const region = getRegionFromId(code);
+    const urlsToTry = [
+      getGameCoverUrl(code),
+      `https://art.gametdb.com/ds/coverM/${region}/${code}.jpg`,
+      `https://art.gametdb.com/ds/coverS/${region}/${code}.png`,
+      `https://art.gametdb.com/ds/cover/EN/${code}.jpg`,
+      `https://art.gametdb.com/ds/coverM/EN/${code}.jpg`,
+      `https://art.gametdb.com/ds/coverS/EN/${code}.png`,
+    ];
 
-    const regionsToTry = Array.from(new Set([
-      defaultRegion,
-      'EN', 'US', 'EU', 'JA', 'IT', 'FR', 'ES', 'DE', 'NL', 'KO', 'AU', 'PT', 'SV', 'NO', 'DA', 'FI', 'PL', 'RU', 'ZH'
-    ]));
-
-    try {
-      const urlsToTry = regionsToTry.flatMap(region => [
-        `https://art.gametdb.com/ds/cover/${region}/${code}.jpg`, // Spostato al primo posto per rispettare la priorità del link di base
-        `https://art.gametdb.com/ds/coverM/${region}/${code}.jpg`,
-        `https://art.gametdb.com/ds/coverM/${region}/${code}.png`,
-        `https://art.gametdb.com/ds/coverDS/${region}/${code}.bmp`,
-        `https://art.gametdb.com/ds/coverS/${region}/${code}.png`
-      ]);
-
-      const dataUrl = await Promise.any(urlsToTry.map(async (originalUrl) => {
-        const proxiedUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalUrl)}&output=png`;
-        return await processImageToDataUrl(proxiedUrl);
-      }));
-      return dataUrl;
-    } catch (e) {
-      return null;
+    for (const originalUrl of urlsToTry) {
+        try {
+            const proxiedUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalUrl)}`;
+            const dataUrl = await processImageToDataUrl(proxiedUrl);
+            if (dataUrl) return dataUrl;
+        } catch (e) {
+            // ignore and try next
+        }
     }
+    
+    return null;
   };
 
   const processMultipleNdsFiles = async (files: File[]) => {
@@ -313,18 +314,7 @@ export default function Home() {
     
     let lines: string[] = [];
     try {
-        const dbsToFetch = ['IT', 'EN', 'US', 'FR', 'ES', 'DE'];
-        for (const langCode of dbsToFetch) {
-            try {
-                const res = await fetch(`/dstdb_${langCode}.txt`);
-                if (res.ok) {
-                    const text = await res.text();
-                    lines = lines.concat(text.split('\n'));
-                }
-            } catch (e) {
-                // ignore
-            }
-        }
+        lines = await fetchAllDbLines();
     } catch (e) {
         console.error("Failed to load dstdb", e);
     }
@@ -631,22 +621,9 @@ export default function Home() {
                     {showDropdown && searchResults.length > 0 && (
                       <ul className={`absolute z-10 w-full mt-1 border rounded-lg shadow-xl max-h-60 overflow-y-auto text-left text-sm divide-y ${theme === 'dark' ? 'bg-zinc-800 border-zinc-600 divide-zinc-700' : 'bg-white border-gray-200 divide-gray-100'}`}>
                         {searchResults.map((game, i) => {
-                          let region = 'EN';
-                          const code = game.id.toUpperCase();
-                          if (code.endsWith('E')) region = 'US'; // E usually USA
-                          else if (code.endsWith('P') || code.endsWith('X') || code.endsWith('Y') || code.endsWith('Z')) region = 'EN'; // P usually Europe
-                          else if (code.endsWith('J')) region = 'JA'; // J usually Japan
-                          else if (code.endsWith('I')) region = 'IT';
-                          else if (code.endsWith('F')) region = 'FR';
-                          else if (code.endsWith('S')) region = 'ES';
-                          else if (code.endsWith('D')) region = 'DE';
-                          else if (code.endsWith('K')) region = 'KO';
-                          else if (code.endsWith('U')) region = 'AU';
-                          else if (code.endsWith('H')) region = 'NL';
-                          
-                          const originalCoverUrl = `https://art.gametdb.com/ds/coverS/${region}/${code}.png`;
-                          const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalCoverUrl)}&output=png`;
-                          const localCoverUrl = `/CoverDS/${code}.bmp`;
+                          const originalCoverUrl = getGameCoverUrl(game.id);
+                          const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalCoverUrl)}`;
+                          const localCoverUrl = `/CoverDS/${game.id.toUpperCase()}.bmp`;
                           
                           return (
                           <li
