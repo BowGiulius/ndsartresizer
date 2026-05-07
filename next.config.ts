@@ -20,6 +20,14 @@ const nextConfig: NextConfig = {
     ],
   },
   output: 'standalone',
+  async rewrites() {
+    return [
+      {
+        source: '/ia-proxy/:path*',
+        destination: 'https://archive.org/:path*',
+      },
+    ];
+  },
   transpilePackages: ['motion'],
   webpack: (config, {dev}) => {
     // HMR is disabled in AI Studio via DISABLE_HMR env var.
