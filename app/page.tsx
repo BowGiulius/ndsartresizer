@@ -10,96 +10,6 @@ import { extractIdFromNDS, getGameCoverUrl, getRegionFromId } from '@/lib/utils'
 let cachedDbLines: string[] | null = null;
 let fetchingDbPromise: Promise<string[]> | null = null;
 
-let cachedApFixFiles: string[] | null = null;
-let fetchingApFixPromise: Promise<string[]> | null = null;
-
-const fetchApFixFiles = async (): Promise<string[]> => {
-  if (cachedApFixFiles) return cachedApFixFiles;
-  if (fetchingApFixPromise) return fetchingApFixPromise;
-  
-  fetchingApFixPromise = (async () => {
-    try {
-      const res = await fetch(`/api/apfix`);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.result) {
-          const apfixes = json.result
-            .map((f: any) => f.name)
-            .filter((name: string) => name.startsWith('apfix/') && name.endsWith('.zip'));
-          cachedApFixFiles = apfixes;
-          return apfixes;
-        }
-      }
-    } catch (e) {
-      console.error('Failed to fetch AP fix list', e);
-    }
-    return [];
-  })();
-  return fetchingApFixPromise;
-};
-
-const findApFixForTitle = async (title: string): Promise<string | null> => {
-  const files = await fetchApFixFiles();
-  if (files.length === 0 || !title) return null;
-  
-  const normalizeForMatch = (str: string) => {
-      let s = str.toLowerCase();
-      s = s.replace(/,\s*the$/, ' ');
-      s = s.replace(/,\s*an?$/, ' ');
-      if (s.startsWith('the ')) s = s.substring(4);
-      if (s.startsWith('a ')) s = s.substring(2);
-      s = s.replace(/[^a-z0-9]/g, '');
-      return s;
-  };
-
-  const cleanTitle = normalizeForMatch(title);
-  
-  let bestMatch: string | null = null;
-  let bestMatchLenDiff = Infinity;
-
-  for (const file of files) {
-    let baseName = file.replace('apfix/', '').replace('_apfix.zip', '');
-    baseName = baseName.replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s*\[.*?\]\s*/g, ' ').trim();
-    const cleanZipName = normalizeForMatch(baseName);
-    
-    if (cleanZipName === cleanTitle) {
-      return file; 
-    }
-    if (cleanZipName.includes(cleanTitle) && cleanTitle.length > 3) {
-      const diff = Math.abs(cleanZipName.length - cleanTitle.length);
-      if (diff < bestMatchLenDiff) {
-        bestMatchLenDiff = diff;
-        bestMatch = file;
-      }
-    } else if (cleanTitle.includes(cleanZipName) && cleanZipName.length > 3) {
-      const diff = Math.abs(cleanTitle.length - cleanZipName.length);
-      if (diff < bestMatchLenDiff) {
-        bestMatchLenDiff = diff;
-        bestMatch = file;
-      }
-    }
-  }
-  return bestMatch;
-};
-
-const getTitleForId = async (code: string): Promise<string | null> => {
-   try {
-     const lines = await fetchAllDbLines();
-     for (let i=1; i < lines.length; i++) {
-       const line = lines[i].trim();
-       if (!line) continue;
-       const indexOfEquals = line.indexOf('=');
-       if (indexOfEquals !== -1) {
-         const idPart = line.substring(0, indexOfEquals).trim();
-         if (idPart.toUpperCase() === code.toUpperCase()) {
-           return line.substring(indexOfEquals + 1).trim();
-         }
-       }
-     }
-   } catch (e) {}
-   return null;
-};
-
 const fetchAllDbLines = async (): Promise<string[]> => {
   if (cachedDbLines) return cachedDbLines;
   if (fetchingDbPromise) return fetchingDbPromise;
@@ -140,7 +50,7 @@ const content = {
     restart: "Ricomincia",
     download: "Scarica",
     errCodeLen: "Il codice ID deve essere di 4 caratteri (es. ADAE) oppure seleziona un gioco dalla lista.",
-    errNotFound: "Né copertina né AP Fix trovati con questo codice/nome.",
+    errNotFound: "Copertina per il codice non trovata su GameTDB.",
     errFormat: "Formato non supportato. Trascina un'immagine o un file .NDS.",
     errReadCode: "Impossibile leggere il codice interno di",
     errConnection: "Errore di connessione a GameTDB.",
@@ -151,7 +61,11 @@ const content = {
     clearAll: "Svuota tutto",
     downloadAll: "Scarica tutti (ZIP)",
     processedCount: "Elaborati",
-    remove: "Rimuovi"
+    remove: "Rimuovi",
+    downloadNds: "Scarica .NDS",
+    fetchingNds: "Cerco .NDS su Archive.org...",
+    ndsFound: "ROM trovata!",
+    ndsNotFound: "ROM non trovata su Archive.org"
   },
   EN: {
     title: "NDS Art Resizer",
@@ -168,7 +82,7 @@ const content = {
     restart: "Start over",
     download: "Download",
     errCodeLen: "The ID code must be 4 characters (ex. ADAE) or select a game from the list.",
-    errNotFound: "Neither cover nor AP Fix found for this query.",
+    errNotFound: "Cover for the code not found on GameTDB.",
     errFormat: "Unsupported format. Drag an image or a .NDS file.",
     errReadCode: "Unable to read internal code of",
     errConnection: "Error connecting to GameTDB.",
@@ -179,7 +93,11 @@ const content = {
     clearAll: "Clear all",
     downloadAll: "Download all (ZIP)",
     processedCount: "Processed",
-    remove: "Remove"
+    remove: "Remove",
+    downloadNds: "Download .NDS",
+    fetchingNds: "Looking for .NDS on Archive.org...",
+    ndsFound: "ROM found!",
+    ndsNotFound: "ROM not found on Archive.org"
   }
 };
 
@@ -187,109 +105,10 @@ interface ProcessedItem {
   id: string;
   url: string;
   name: string;
+  ndsData?: Uint8Array;
+  ndsName?: string;
   gameCode?: string;
-  gameTitle?: string | null;
-  apFixZipPath?: string | null;
 }
-
-const ApFixControls = ({ item, theme }: { item: ProcessedItem; theme: string }) => {
-  const [downloadingZip, setDownloadingZip] = useState(false);
-  const [downloadingNdS, setDownloadingNdS] = useState(false);
-
-  if (!item.apFixZipPath) return null;
-
-  const handleDownload = async (extractNds: boolean) => {
-    if (!item.apFixZipPath) return;
-    const setter = extractNds ? setDownloadingNdS : setDownloadingZip;
-    setter(true);
-
-    try {
-      const parts = item.apFixZipPath.split('/');
-
-      if (!extractNds) {
-        // Scarica lo ZIP originale direttamente
-        const directUrl = `https://archive.org/download/nds_apfix/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}`;
-        const a = document.createElement("a");
-        a.href = directUrl;
-        a.click();
-        setter(false);
-        return;
-      }
-
-      // Scarica il ZIP dell'AP Fix tramite proxy
-      const proxyUrl = `/api/download?file=${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}`;
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error("Fetch AP Fix fallito: " + response.status);
-      const arrayBuffer = await response.arrayBuffer();
-
-      const u8 = new Uint8Array(arrayBuffer);
-      const unzipped = fflate.unzipSync(u8);
-      const ndsFileName = Object.keys(unzipped).find(k => k.toLowerCase().endsWith('.nds'));
-
-      if (!ndsFileName) {
-        alert("Nessun file .nds trovato nell'AP Fix!");
-        return;
-      }
-
-      const ndsData = unzipped[ndsFileName];
-      const baseName = ndsFileName.split('/').pop()!.replace(/\.nds$/i, '') || (item.gameTitle || 'game') + '_apfix';
-
-      // Costruisce un unico ZIP con .nds + artbox
-      const outputFiles: Record<string, Uint8Array> = {};
-      outputFiles[baseName + '.nds'] = ndsData;
-
-      if (item.url) {
-        const base64 = item.url.replace(/^data:image\/png;base64,/, '');
-        const binary = atob(base64);
-        const artBytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) artBytes[i] = binary.charCodeAt(i);
-        // Nome artbox compatibile con TWiLight Menu++ (/_nds/TWiLightMenu/boxart)
-        outputFiles[baseName + '.nds.png'] = artBytes;
-      }
-
-      const zipped = fflate.zipSync(outputFiles);
-      const blob = new Blob([zipped as any], { type: 'application/zip' });
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = baseName + '_apfix+art.zip';
-      a.click();
-      URL.revokeObjectURL(blobUrl);
-
-    } catch (e) {
-      console.error(e);
-      alert("Errore durante il download dell'AP Fix.");
-    } finally {
-      setter(false);
-    }
-  };
-
-  return (
-    <div className={`flex flex-col gap-1 w-full mt-2 border-t pt-2 ${theme === 'dark' ? 'border-zinc-700' : 'border-gray-200'}`}>
-      <span className={`text-[10px] text-center font-semibold ${theme === 'dark' ? 'text-green-400' : 'text-green-600'}`}>
-        AP Fix Disponibile!
-      </span>
-      <div className="flex gap-1 justify-center w-full px-1">
-        <button
-          onClick={() => handleDownload(false)}
-          disabled={downloadingZip || downloadingNdS}
-          className={`flex-1 flex justify-center items-center text-[10px] py-1 px-1 rounded font-medium border transition-colors ${theme === 'dark' ? 'border-zinc-600 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50' : 'border-gray-300 hover:bg-gray-100 text-gray-700 disabled:opacity-50'}`}
-          title="Scarica file .ZIP Originale"
-        >
-          {downloadingZip ? <Loader2 className="w-3 h-3 animate-spin mx-auto"/> : "ZIP"}
-        </button>
-        <button
-          onClick={() => handleDownload(true)}
-          disabled={downloadingNdS || downloadingZip}
-          className={`flex-1 flex justify-center items-center text-[10px] py-1 px-1 rounded font-medium border text-white transition-colors ${theme === 'dark' ? 'border-green-700 bg-green-700/80 hover:bg-green-600/80 disabled:opacity-50' : 'border-green-600 bg-green-600 hover:bg-green-700 disabled:opacity-50'}`}
-          title="Estrai la ROM .NDS e l'Artbox patchata"
-        >
-          {downloadingNdS ? <Loader2 className="w-3 h-3 animate-spin mx-auto"/> : ".NDS + Art"}
-        </button>
-      </div>
-    </div>
-  );
-};
 
 export default function Home() {
   const [processedItems, setProcessedItems] = useState<ProcessedItem[]>([]);
@@ -450,25 +269,79 @@ export default function Home() {
   };
 
   const fetchBoxartFromWeserv = async (code: string): Promise<string | null> => {
+    // Prima tenta di caricare il file BMP locale presente in /CoverDS o nelle sottocartelle
+    try {
+      const localUrls = [
+        `/CoverDS/${code}.bmp`,
+        `/CoverDS/IT/${code}.bmp`,
+        `/CoverDS/EN/${code}.bmp`,
+        `/CoverDS/US/${code}.bmp`
+      ];
+
+      for (const localUrl of localUrls) {
+        try {
+          const res = await fetch(localUrl, { method: 'HEAD' });
+          if (res.ok) {
+            return await processImageToDataUrl(localUrl);
+          }
+        } catch(e) {
+          // ignore error for this specific url
+        }
+      }
+    } catch (e) {
+      console.warn("Local cover not found or error checking local cover:", e);
+    }
+
     const region = getRegionFromId(code);
-    // Solo artbox GameTDB: cover nella regione del gioco, fallback EN
     const urlsToTry = [
       getGameCoverUrl(code),
+      `https://art.gametdb.com/ds/coverM/${region}/${code}.jpg`,
+      `https://art.gametdb.com/ds/coverS/${region}/${code}.png`,
       `https://art.gametdb.com/ds/cover/EN/${code}.jpg`,
-      `https://art.gametdb.com/ds/cover/US/${code}.jpg`,
+      `https://art.gametdb.com/ds/coverM/EN/${code}.jpg`,
+      `https://art.gametdb.com/ds/coverS/EN/${code}.png`,
     ];
 
     for (const originalUrl of urlsToTry) {
-      try {
-        const proxiedUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalUrl)}`;
-        const dataUrl = await processImageToDataUrl(proxiedUrl);
-        if (dataUrl) return dataUrl;
-      } catch (e) {
-        // prova il prossimo
-      }
+        try {
+            const proxiedUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalUrl)}`;
+            const dataUrl = await processImageToDataUrl(proxiedUrl);
+            if (dataUrl) return dataUrl;
+        } catch (e) {
+            // ignore and try next
+        }
     }
-
+    
     return null;
+  };
+
+  // Cerca e scarica il file .nds da archive.org/nds_apfix/apfix/
+  // La struttura è: ogni file è uno zip chiamato "<GAMECODE>.zip" che contiene un .nds
+  const fetchNdsFromApfix = async (code: string): Promise<{ data: Uint8Array; name: string } | null> => {
+    const upperCode = code.toUpperCase();
+    const zipUrl = `https://archive.org/download/nds_apfix/apfix/${upperCode}.zip`;
+    try {
+      const res = await fetch(zipUrl);
+      if (!res.ok) return null;
+      const arrayBuffer = await res.arrayBuffer();
+      const zipData = new Uint8Array(arrayBuffer);
+      // Estrai il contenuto usando fflate
+      const decompressed = await new Promise<Record<string, Uint8Array>>((resolve, reject) => {
+        fflate.unzip(zipData, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+      // Trova il primo file .nds all'interno dello zip
+      const ndsEntry = Object.entries(decompressed).find(([name]) =>
+        name.toLowerCase().endsWith('.nds')
+      );
+      if (!ndsEntry) return null;
+      return { data: ndsEntry[1], name: ndsEntry[0].split('/').pop() || `${upperCode}.nds` };
+    } catch (e) {
+      console.warn('apfix fetch failed for', code, e);
+      return null;
+    }
   };
 
   const processMultipleNdsFiles = async (files: File[]) => {
@@ -542,22 +415,22 @@ export default function Home() {
             }
             
             if (foundCode) {
-                const dataUrl = await fetchBoxartFromWeserv(foundCode);
-                const gameTitle = await getTitleForId(foundCode);
-                const apFixZipPath = gameTitle ? await findApFixForTitle(gameTitle) : null;
-                
-                if (dataUrl || apFixZipPath) {
+                const [dataUrl, ndsResult] = await Promise.all([
+                    fetchBoxartFromWeserv(foundCode),
+                    fetchNdsFromApfix(foundCode)
+                ]);
+                if (dataUrl) {
                     newItems.push({
                         id: Math.random().toString(36).substring(2, 11),
-                        url: dataUrl || '',
+                        url: dataUrl,
                         name: `${baseName}.nds.png`,
                         gameCode: foundCode,
-                        gameTitle: gameTitle || baseName,
-                        apFixZipPath
+                        ndsData: ndsResult?.data,
+                        ndsName: ndsResult?.name ?? `${foundCode}.nds`
                     });
                     successCount++;
                 } else {
-                    console.error(`Neither Cover nor AP Fix found for ID: ${foundCode} (Game: ${baseName})`);
+                    console.error(`Cover not found for ID: ${foundCode} (Game: ${baseName})`);
                 }
             } else {
                 console.error(`Could not determine code for Game: ${baseName}`);
@@ -586,18 +459,18 @@ export default function Home() {
     setErrorStatus(null);
     setShowDropdown(false);
     try {
-      const dataUrl = await fetchBoxartFromWeserv(code);
-      const gameTitle = customTitle || await getTitleForId(code);
-      const apFixZipPath = gameTitle ? await findApFixForTitle(gameTitle) : null;
-      
-      if (dataUrl || apFixZipPath) {
+      const [dataUrl, ndsResult] = await Promise.all([
+        fetchBoxartFromWeserv(code),
+        fetchNdsFromApfix(code)
+      ]);
+      if (dataUrl) {
         setProcessedItems(prev => [{
             id: Math.random().toString(36).substring(2, 11),
-            url: dataUrl || '',
-            name: `${gameTitle || customTitle || code}.nds.png`,
+            url: dataUrl,
+            name: `${customTitle || code}.nds.png`,
             gameCode: code,
-            gameTitle,
-            apFixZipPath
+            ndsData: ndsResult?.data,
+            ndsName: ndsResult?.name ?? `${code}.nds`
         }, ...prev]);
         setSearchQuery('');
       } else {
@@ -629,6 +502,7 @@ export default function Home() {
       const files: Record<string, Uint8Array> = {};
       
       processedItems.forEach(item => {
+          // Aggiungi la copertina PNG
           const base64Data = item.url.replace(/^data:image\/png;base64,/, "");
           const binaryString = atob(base64Data);
           const len = binaryString.length;
@@ -644,6 +518,17 @@ export default function Home() {
               counter++;
           }
           files[fileName] = bytes;
+
+          // Se disponibile, aggiungi anche il file .nds da apfix
+          if (item.ndsData && item.ndsName) {
+              let ndsFileName = item.ndsName;
+              let ndsCounter = 1;
+              while (files[ndsFileName]) {
+                  ndsFileName = item.ndsName.replace(/\.nds$/i, ` (${ndsCounter}).nds`);
+                  ndsCounter++;
+              }
+              files[ndsFileName] = item.ndsData;
+          }
       });
 
       const zipped = fflate.zipSync(files);
@@ -800,8 +685,10 @@ export default function Home() {
                     {showDropdown && searchResults.length > 0 && (
                       <ul className={`absolute z-10 w-full mt-1 border rounded-lg shadow-xl max-h-60 overflow-y-auto text-left text-sm divide-y ${theme === 'dark' ? 'bg-zinc-800 border-zinc-600 divide-zinc-700' : 'bg-white border-gray-200 divide-gray-100'}`}>
                         {searchResults.map((game, i) => {
-                          const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(getGameCoverUrl(game.id))}`;
-
+                          const originalCoverUrl = getGameCoverUrl(game.id);
+                          const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalCoverUrl)}`;
+                          const localCoverUrl = `/CoverDS/${game.id.toUpperCase()}.bmp`;
+                          
                           return (
                           <li
                             key={i}
@@ -811,7 +698,7 @@ export default function Home() {
                             <div className="flex items-center gap-3 overflow-hidden">
                               <div className={`w-8 h-8 shrink-0 rounded flex items-center justify-center overflow-hidden border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-700' : 'bg-gray-100 border-gray-200'}`}>
                                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                                <img src={coverUrl} alt="" className="w-full h-full object-cover" onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }} />
+                                <img src={localCoverUrl} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.src = coverUrl; e.currentTarget.onerror = function() { (this as HTMLImageElement).style.display = 'none'; }; }} />
                               </div>
                               <span className={`font-medium break-words whitespace-normal leading-tight pr-2 ${theme === 'dark' ? 'text-zinc-200' : 'text-gray-800'}`}>{game.title}</span>
                             </div>
@@ -867,33 +754,49 @@ export default function Home() {
                       </button>
                     </div>
                     
-                    {item.url ? (
-                      <div className={`shadow-sm border overflow-hidden bg-black flex items-center justify-center mt-2 ${theme === 'dark' ? 'border-zinc-600' : 'border-gray-200'}`} style={{ width: 128, height: 115 }}>
-                        {/* eslint-disable-next-line @next/next/no-img-element */}
-                        <img src={item.url} alt="Preview" className="block" style={{ width: 128, height: 115, objectFit: 'fill' }} />
-                      </div>
-                    ) : (
-                      <div className={`shadow-sm border overflow-hidden flex flex-col items-center justify-center mt-2 ${theme === 'dark' ? 'border-zinc-600 bg-zinc-900 border-dashed text-zinc-600' : 'border-gray-200 bg-gray-50 border-dashed text-gray-400'}`} style={{ width: 128, height: 115 }}>
-                        <ImageIcon className="w-8 h-8 mb-1 opacity-50" />
-                        <span className="text-[10px] text-center px-2 font-medium">Nessuna Copertina</span>
+                    <div className={`shadow-sm border overflow-hidden bg-black flex items-center justify-center mt-2 ${theme === 'dark' ? 'border-zinc-600' : 'border-gray-200'}`} style={{ width: 128, height: 115 }}>
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={item.url} alt="Preview" className="block" style={{ width: 128, height: 115, objectFit: 'fill' }} />
+                    </div>
+
+                    {/* Badge stato ROM da apfix */}
+                    {item.gameCode && (
+                      <div className={`mt-2 text-[10px] font-semibold px-2 py-0.5 rounded-full ${item.ndsData ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-zinc-100 text-zinc-400 dark:bg-zinc-700/50 dark:text-zinc-500'}`}>
+                        {item.ndsData ? `🎮 ${t.ndsFound}` : t.ndsNotFound}
                       </div>
                     )}
                     
-                    <p className={`text-xs mt-3 truncate w-full text-center px-1 font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-gray-700'}`} title={item.gameTitle || item.name}>
-                      {item.gameTitle || item.name}
+                    <p className={`text-xs mt-2 truncate w-full text-center px-1 font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-gray-700'}`} title={item.name}>
+                      {item.name}
                     </p>
                     
-                    {!item.apFixZipPath && item.url && (
-                      <a
-                        href={item.url}
-                        download={item.name}
-                        className={`mt-2 flex items-center justify-center gap-1.5 py-1.5 w-full rounded-md text-xs font-semibold border transition-colors ${theme === 'dark' ? 'border-zinc-600 hover:bg-zinc-700 text-zinc-200 bg-zinc-800' : 'border-gray-300 hover:bg-gray-50 text-gray-700 bg-white'}`}
+                    <a
+                      href={item.url}
+                      download={item.name}
+                      className={`mt-2 flex items-center justify-center gap-1.5 py-1.5 w-full rounded-md text-xs font-semibold border transition-colors ${theme === 'dark' ? 'border-zinc-600 hover:bg-zinc-700 text-zinc-200 bg-zinc-800' : 'border-gray-300 hover:bg-gray-50 text-gray-700 bg-white'}`}
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      {t.download}
+                    </a>
+
+                    {/* Pulsante download .NDS se trovato su archive.org */}
+                    {item.ndsData && item.ndsName && (
+                      <button
+                        onClick={() => {
+                          const blob = new Blob([item.ndsData!], { type: 'application/octet-stream' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = item.ndsName!;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className={`mt-1 flex items-center justify-center gap-1.5 py-1.5 w-full rounded-md text-xs font-semibold border transition-colors ${theme === 'dark' ? 'border-green-700 hover:bg-green-900/30 text-green-400 bg-zinc-800' : 'border-green-300 hover:bg-green-50 text-green-700 bg-white'}`}
                       >
                         <Download className="w-3.5 h-3.5" />
-                        {t.download}
-                      </a>
+                        {t.downloadNds}
+                      </button>
                     )}
-                    <ApFixControls item={item} theme={theme} />
                   </div>
                 ))}
               </div>
