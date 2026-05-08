@@ -61,11 +61,7 @@ const content = {
     clearAll: "Svuota tutto",
     downloadAll: "Scarica tutti (ZIP)",
     processedCount: "Elaborati",
-    remove: "Rimuovi",
-    downloadNds: "Scarica .NDS",
-    fetchingNds: "Cerco .NDS su Archive.org...",
-    ndsFound: "ROM trovata!",
-    ndsNotFound: "ROM non disponibile"
+    remove: "Rimuovi"
   },
   EN: {
     title: "NDS Art Resizer",
@@ -93,11 +89,7 @@ const content = {
     clearAll: "Clear all",
     downloadAll: "Download all (ZIP)",
     processedCount: "Processed",
-    remove: "Remove",
-    downloadNds: "Download .NDS",
-    fetchingNds: "Looking for .NDS on Archive.org...",
-    ndsFound: "ROM found!",
-    ndsNotFound: "ROM not available"
+    remove: "Remove"
   }
 };
 
@@ -105,10 +97,6 @@ interface ProcessedItem {
   id: string;
   url: string;
   name: string;
-  ndsData?: Uint8Array;
-  ndsName?: string;
-  ndsSource?: 'apfix' | 'discord';
-  gameCode?: string;
 }
 
 export default function Home() {
@@ -301,10 +289,6 @@ export default function Home() {
       `https://art.gametdb.com/ds/cover/EN/${code}.jpg`,
       `https://art.gametdb.com/ds/coverM/EN/${code}.jpg`,
       `https://art.gametdb.com/ds/coverS/EN/${code}.png`,
-      // Fallback: usa il label (etichetta cartuccia) se nessuna copertina è disponibile
-      `https://art.gametdb.com/ds/label/${region}/${code}.png`,
-      `https://art.gametdb.com/ds/label/US/${code}.png`,
-      `https://art.gametdb.com/ds/label/EN/${code}.png`,
     ];
 
     for (const originalUrl of urlsToTry) {
@@ -320,93 +304,7 @@ export default function Home() {
     return null;
   };
 
-  // ── NDS download helpers ──────────────────────────────────────────────────
-  // Cache per i lookup statici (code -> apfix name / discord filename)
-  const ndsMapCache: {
-    apfix: Record<string,string> | null;
-    discord: Record<string,string> | null;
-    discordList: Array<{filename:string; url:string}> | null;
-  } = { apfix: null, discord: null, discordList: null };
-
-  const fetchNdsMaps = async () => {
-    if (ndsMapCache.apfix && ndsMapCache.discord && ndsMapCache.discordList) return ndsMapCache;
-    const [apfixRes, discordMapRes, discordListRes] = await Promise.all([
-      fetch('/apfix_map.json').then(r => r.json()),
-      fetch('/discord_map.json').then(r => r.json()),
-      fetch('/listadiscord.txt').then(r => r.json()),
-    ]);
-    ndsMapCache.apfix = apfixRes as Record<string,string>;
-    ndsMapCache.discord = discordMapRes as Record<string,string>;
-    ndsMapCache.discordList = (discordListRes.attachments ?? []) as Array<{filename:string; url:string}>;
-    return ndsMapCache;
-  };
-
-  /**
-   * Scarica il file .nds per il codice dato.
-   * Prima controlla apfix_map.json (archive.org), poi discord_map.json (Discord CDN).
-   * Usa un timeout di 45s per evitare hang infiniti.
-   */
-  const fetchNdsFromApfix = async (code: string): Promise<{ data: Uint8Array; name: string; source: 'apfix' | 'discord' } | null> => {
-    const upperCode = code.toUpperCase();
-    try {
-      const maps = await fetchNdsMaps();
-
-      // ── 1. Prova archive.org ──────────────────────────────────────────────
-      const apfixName = maps.apfix?.[upperCode];
-      if (apfixName) {
-        const zipName  = `${apfixName}_apfix.zip`;
-        const ndsName  = `${apfixName}_apfix.nds`;
-        const ndsUrl   = `https://archive.org/download/nds_apfix/apfix/${encodeURIComponent(zipName)}/${encodeURIComponent(ndsName)}`;
-        console.log('apfix: scarico', ndsUrl);
-        try {
-          const ctrl = new AbortController();
-          const timer = setTimeout(() => ctrl.abort(), 45_000);
-          const res = await fetch(ndsUrl, { signal: ctrl.signal });
-          clearTimeout(timer);
-          if (res.ok) {
-            const data = new Uint8Array(await res.arrayBuffer());
-            return { data, name: `${apfixName}.nds`, source: 'apfix' };
-          }
-          console.warn('apfix: HTTP', res.status);
-        } catch (e) {
-          console.warn('apfix: fetch error', e);
-        }
-      }
-
-      // ── 2. Fallback: Discord CDN ──────────────────────────────────────────
-      const discordFilename = maps.discord?.[upperCode];
-      if (discordFilename && maps.discordList) {
-        const att = maps.discordList.find(a => a.filename === discordFilename);
-        if (att?.url) {
-          console.log('discord: scarico', att.url);
-          try {
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), 45_000);
-            const res = await fetch(att.url, { signal: ctrl.signal });
-            clearTimeout(timer);
-            if (res.ok) {
-              const data = new Uint8Array(await res.arrayBuffer());
-              // Nome pulito dal filename discord: "0022_-_Super_Mario_64_DS_Europe_EnFrDeEsIt.nds"
-              // -> "Super Mario 64 DS (Europe) (En,Fr,De,Es,It).nds" (usiamo il filename com'è, è già descrittivo)
-              const cleanName = discordFilename.replace(/^\d+_-_/, '').replace(/_/g, ' ').replace(/\.nds$/i, '') + '.nds';
-              return { data, name: cleanName, source: 'discord' };
-            }
-            console.warn('discord: HTTP', res.status, '(URL probabilmente scaduto)');
-          } catch (e) {
-            console.warn('discord: fetch error', e);
-          }
-        }
-      }
-
-      console.warn('nds: nessuna fonte disponibile per', upperCode);
-      return null;
-    } catch (e) {
-      console.warn('fetchNdsFromApfix failed for', code, e);
-      return null;
-    }
-  };
-
-      const processMultipleNdsFiles = async (files: File[]) => {
+  const processMultipleNdsFiles = async (files: File[]) => {
     setIsProcessing(true);
     setProcessingProgress({ current: 0, total: files.length });
     setErrorStatus(null);
@@ -477,22 +375,12 @@ export default function Home() {
             }
             
             if (foundCode) {
-                const [dataUrl, ndsResult] = await Promise.all([
-                    fetchBoxartFromWeserv(foundCode),
-                    fetchNdsFromApfix(foundCode)
-                ]);
+                const dataUrl = await fetchBoxartFromWeserv(foundCode);
                 if (dataUrl) {
-                    // Il nome dell'artbox deve corrispondere al nome del .nds (senza _apfix)
-                    const ndsFileName = ndsResult?.name ?? `${baseName}.nds`;
-                    const artboxName = ndsFileName.replace(/\.nds$/i, '.nds.png');
                     newItems.push({
                         id: Math.random().toString(36).substring(2, 11),
                         url: dataUrl,
-                        name: artboxName,
-                        gameCode: foundCode,
-                        ndsData: ndsResult?.data,
-                        ndsName: ndsFileName,
-                        ndsSource: ndsResult?.source
+                        name: `${baseName}.nds.png`
                     });
                     successCount++;
                 } else {
@@ -525,21 +413,12 @@ export default function Home() {
     setErrorStatus(null);
     setShowDropdown(false);
     try {
-      const [dataUrl, ndsResult] = await Promise.all([
-        fetchBoxartFromWeserv(code),
-        fetchNdsFromApfix(code)
-      ]);
+      const dataUrl = await fetchBoxartFromWeserv(code);
       if (dataUrl) {
-        const ndsFileName = ndsResult?.name ?? `${customTitle || code}.nds`;
-        const artboxName = ndsFileName.replace(/\.nds$/i, '.nds.png');
         setProcessedItems(prev => [{
             id: Math.random().toString(36).substring(2, 11),
             url: dataUrl,
-            name: artboxName,
-            gameCode: code,
-            ndsData: ndsResult?.data,
-            ndsName: ndsFileName,
-            ndsSource: ndsResult?.source
+            name: `${customTitle || code}.nds.png`
         }, ...prev]);
         setSearchQuery('');
       } else {
@@ -571,7 +450,6 @@ export default function Home() {
       const files: Record<string, Uint8Array> = {};
       
       processedItems.forEach(item => {
-          // Aggiungi la copertina PNG
           const base64Data = item.url.replace(/^data:image\/png;base64,/, "");
           const binaryString = atob(base64Data);
           const len = binaryString.length;
@@ -587,17 +465,6 @@ export default function Home() {
               counter++;
           }
           files[fileName] = bytes;
-
-          // Se disponibile, aggiungi anche il file .nds da apfix
-          if (item.ndsData && item.ndsName) {
-              let ndsFileName = item.ndsName;
-              let ndsCounter = 1;
-              while (files[ndsFileName]) {
-                  ndsFileName = item.ndsName.replace(/\.nds$/i, ` (${ndsCounter}).nds`);
-                  ndsCounter++;
-              }
-              files[ndsFileName] = item.ndsData;
-          }
       });
 
       const zipped = fflate.zipSync(files);
@@ -758,20 +625,6 @@ export default function Home() {
                           const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalCoverUrl)}`;
                           const localCoverUrl = `/CoverDS/${game.id.toUpperCase()}.bmp`;
                           
-                          const gameRegion = getRegionFromId(game.id);
-                          const regionLabel: Record<string, string> = {
-                            US: 'US', EN: 'EU', IT: 'IT', FR: 'FR', ES: 'ES', DE: 'DE', JA: 'JA', KO: 'KO'
-                          };
-                          const regionColors: Record<string, string> = {
-                            US: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
-                            EN: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300',
-                            IT: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
-                            FR: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300',
-                            ES: 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300',
-                            DE: 'bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200',
-                            JA: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
-                            KO: 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300',
-                          };
                           return (
                           <li
                             key={i}
@@ -785,10 +638,7 @@ export default function Home() {
                               </div>
                               <span className={`font-medium break-words whitespace-normal leading-tight pr-2 ${theme === 'dark' ? 'text-zinc-200' : 'text-gray-800'}`}>{game.title}</span>
                             </div>
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${regionColors[gameRegion] ?? 'bg-zinc-100 text-zinc-500'}`}>{regionLabel[gameRegion] ?? gameRegion}</span>
-                              <span className={`text-xs font-mono ${theme === 'dark' ? 'text-zinc-500 group-hover:text-blue-400' : 'text-gray-400 group-hover:text-blue-500'}`}>{game.id}</span>
-                            </div>
+                            <span className={`text-xs font-mono shrink-0 ${theme === 'dark' ? 'text-zinc-500 group-hover:text-blue-400' : 'text-gray-400 group-hover:text-blue-500'}`}>{game.id}</span>
                           </li>
                         )})}
                        </ul>
@@ -844,15 +694,8 @@ export default function Home() {
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img src={item.url} alt="Preview" className="block" style={{ width: 128, height: 115, objectFit: 'fill' }} />
                     </div>
-
-                    {/* Badge stato ROM da apfix */}
-                    {item.gameCode && (
-                      <div className={`mt-2 text-[10px] font-semibold px-2 py-0.5 rounded-full ${item.ndsData ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-zinc-100 text-zinc-400 dark:bg-zinc-700/50 dark:text-zinc-500'}`}>
-                        {item.ndsData ? `🎮 ${t.ndsFound}${item.ndsSource === 'discord' ? ' · Discord' : ' · Archive.org'}` : t.ndsNotFound}
-                      </div>
-                    )}
                     
-                    <p className={`text-xs mt-2 truncate w-full text-center px-1 font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-gray-700'}`} title={item.name}>
+                    <p className={`text-xs mt-3 truncate w-full text-center px-1 font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-gray-700'}`} title={item.name}>
                       {item.name}
                     </p>
                     
@@ -864,25 +707,6 @@ export default function Home() {
                       <Download className="w-3.5 h-3.5" />
                       {t.download}
                     </a>
-
-                    {/* Pulsante download .NDS se trovato su archive.org */}
-                    {item.ndsData && item.ndsName && (
-                      <button
-                        onClick={() => {
-                          const blob = new Blob([item.ndsData!.buffer as ArrayBuffer], { type: 'application/octet-stream' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url;
-                          a.download = item.ndsName!;
-                          a.click();
-                          URL.revokeObjectURL(url);
-                        }}
-                        className={`mt-1 flex items-center justify-center gap-1.5 py-1.5 w-full rounded-md text-xs font-semibold border transition-colors ${theme === 'dark' ? 'border-green-700 hover:bg-green-900/30 text-green-400 bg-zinc-800' : 'border-green-300 hover:bg-green-50 text-green-700 bg-white'}`}
-                      >
-                        <Download className="w-3.5 h-3.5" />
-                        {t.downloadNds}
-                      </button>
-                    )}
                   </div>
                 ))}
               </div>
