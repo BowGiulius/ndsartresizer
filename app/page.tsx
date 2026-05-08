@@ -315,31 +315,77 @@ export default function Home() {
     return null;
   };
 
-  // Cerca e scarica il file .nds da archive.org/nds_apfix/apfix/
-  // La struttura è: ogni file è uno zip chiamato "<GAMECODE>.zip" che contiene un .nds
-  const fetchNdsFromApfix = async (code: string): Promise<{ data: Uint8Array; name: string } | null> => {
-    const upperCode = code.toUpperCase();
-    const zipUrl = `https://archive.org/download/nds_apfix/apfix/${upperCode}.zip`;
-    try {
-      const res = await fetch(zipUrl);
-      if (!res.ok) return null;
-      const arrayBuffer = await res.arrayBuffer();
-      const zipData = new Uint8Array(arrayBuffer);
-      // Estrai il contenuto usando fflate
-      const decompressed = await new Promise<Record<string, Uint8Array>>((resolve, reject) => {
-        fflate.unzip(zipData, (err, data) => {
-          if (err) reject(err);
-          else resolve(data);
-        });
+  // Cache per la lista apfix
+  const apfixListCache: { lines: string[] | null; promise: Promise<string[]> | null } = { lines: null, promise: null };
+
+  const fetchApfixList = async (): Promise<string[]> => {
+    if (apfixListCache.lines) return apfixListCache.lines;
+    if (apfixListCache.promise) return apfixListCache.promise;
+    apfixListCache.promise = fetch('/listaaaa.txt')
+      .then(r => r.text())
+      .then(text => {
+        const lines = text.split('\n').map((l: string) => l.replace(/\r/g, '').trim()).filter(Boolean);
+        apfixListCache.lines = lines;
+        return lines;
       });
-      // Trova il primo file .nds all'interno dello zip
-      const ndsEntry = Object.entries(decompressed).find(([name]) =>
-        name.toLowerCase().endsWith('.nds')
-      );
-      if (!ndsEntry) return null;
-      return { data: ndsEntry[1], name: ndsEntry[0].split('/').pop() || `${upperCode}.nds` };
+    return apfixListCache.promise;
+  };
+
+  // Cerca e scarica il file .nds da archive.org/nds_apfix/apfix/ usando il nome del gioco
+  // Struttura: <Nome Gioco>_apfix.zip contiene <Nome Gioco>_apfix.nds
+  // Il .nds viene rinominato rimuovendo _apfix
+  const fetchNdsFromApfix = async (gameTitle: string): Promise<{ data: Uint8Array; name: string } | null> => {
+    try {
+      const list = await fetchApfixList();
+
+      const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const normalizedInput = normalize(gameTitle);
+
+      let bestMatch: string | null = null;
+      let bestScore = 0;
+
+      for (const line of list) {
+        const zipNameMatch = line.match(/^(.+?)_apfix\.zip/i);
+        if (!zipNameMatch) continue;
+        const zipGameName = zipNameMatch[1];
+        const normalizedZip = normalize(zipGameName);
+
+        if (normalizedZip === normalizedInput) {
+          bestMatch = zipGameName;
+          break;
+        }
+        if (normalizedInput.length > 4 && normalizedZip.includes(normalizedInput)) {
+          const score = normalizedInput.length;
+          if (score > bestScore) { bestScore = score; bestMatch = zipGameName; }
+        }
+        if (normalizedZip.length > 4 && normalizedInput.includes(normalizedZip)) {
+          const score = normalizedZip.length;
+          if (score > bestScore) { bestScore = score; bestMatch = zipGameName; }
+        }
+      }
+
+      if (!bestMatch) {
+        console.warn('apfix: nessun match trovato per', gameTitle);
+        return null;
+      }
+
+      const encodedZipName = encodeURIComponent(`${bestMatch}_apfix.zip`);
+      const encodedNdsName = encodeURIComponent(`${bestMatch}_apfix.nds`);
+      const ndsUrl = `https://archive.org/download/nds_apfix/apfix/${encodedZipName}/${encodedNdsName}`;
+
+      const res = await fetch(ndsUrl);
+      if (!res.ok) {
+        console.warn('apfix: download fallito', res.status, ndsUrl);
+        return null;
+      }
+
+      const arrayBuffer = await res.arrayBuffer();
+      const data = new Uint8Array(arrayBuffer);
+      // Nome finale senza _apfix
+      const cleanName = `${bestMatch}.nds`;
+      return { data, name: cleanName };
     } catch (e) {
-      console.warn('apfix fetch failed for', code, e);
+      console.warn('apfix fetch failed for', gameTitle, e);
       return null;
     }
   };
@@ -417,16 +463,19 @@ export default function Home() {
             if (foundCode) {
                 const [dataUrl, ndsResult] = await Promise.all([
                     fetchBoxartFromWeserv(foundCode),
-                    fetchNdsFromApfix(foundCode)
+                    fetchNdsFromApfix(baseName)
                 ]);
                 if (dataUrl) {
+                    // Il nome dell'artbox deve corrispondere al nome del .nds (senza _apfix)
+                    const ndsFileName = ndsResult?.name ?? `${baseName}.nds`;
+                    const artboxName = ndsFileName.replace(/\.nds$/i, '.nds.png');
                     newItems.push({
                         id: Math.random().toString(36).substring(2, 11),
                         url: dataUrl,
-                        name: `${baseName}.nds.png`,
+                        name: artboxName,
                         gameCode: foundCode,
                         ndsData: ndsResult?.data,
-                        ndsName: ndsResult?.name ?? `${foundCode}.nds`
+                        ndsName: ndsFileName
                     });
                     successCount++;
                 } else {
@@ -461,16 +510,18 @@ export default function Home() {
     try {
       const [dataUrl, ndsResult] = await Promise.all([
         fetchBoxartFromWeserv(code),
-        fetchNdsFromApfix(code)
+        fetchNdsFromApfix(customTitle || code)
       ]);
       if (dataUrl) {
+        const ndsFileName = ndsResult?.name ?? `${customTitle || code}.nds`;
+        const artboxName = ndsFileName.replace(/\.nds$/i, '.nds.png');
         setProcessedItems(prev => [{
             id: Math.random().toString(36).substring(2, 11),
             url: dataUrl,
-            name: `${customTitle || code}.nds.png`,
+            name: artboxName,
             gameCode: code,
             ndsData: ndsResult?.data,
-            ndsName: ndsResult?.name ?? `${code}.nds`
+            ndsName: ndsFileName
         }, ...prev]);
         setSearchQuery('');
       } else {
