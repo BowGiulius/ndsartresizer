@@ -65,7 +65,7 @@ const content = {
     downloadNds: "Scarica .NDS",
     fetchingNds: "Cerco .NDS su Archive.org...",
     ndsFound: "ROM trovata!",
-    ndsNotFound: "ROM non trovata su Archive.org"
+    ndsNotFound: "ROM non disponibile"
   },
   EN: {
     title: "NDS Art Resizer",
@@ -97,7 +97,7 @@ const content = {
     downloadNds: "Download .NDS",
     fetchingNds: "Looking for .NDS on Archive.org...",
     ndsFound: "ROM found!",
-    ndsNotFound: "ROM not found on Archive.org"
+    ndsNotFound: "ROM not available"
   }
 };
 
@@ -107,6 +107,7 @@ interface ProcessedItem {
   name: string;
   ndsData?: Uint8Array;
   ndsName?: string;
+  ndsSource?: 'apfix' | 'discord';
   gameCode?: string;
 }
 
@@ -319,146 +320,93 @@ export default function Home() {
     return null;
   };
 
-  // ── Apfix helpers ─────────────────────────────────────────────────────────
-  // Cache per listaaaa.txt (indice dei file su archive.org)
-  const apfixListCache: { lines: string[] | null; promise: Promise<string[]> | null } = { lines: null, promise: null };
-  const fetchApfixList = async (): Promise<string[]> => {
-    if (apfixListCache.lines) return apfixListCache.lines;
-    if (apfixListCache.promise) return apfixListCache.promise;
-    apfixListCache.promise = fetch('/listaaaa.txt')
-      .then(r => r.text())
-      .then(text => {
-        const lines = text.split('\n')
-          .map((l: string) => l.replace(/\r/g, '').trim())
-          .filter((l: string) => l.includes('_apfix.zip'));
-        apfixListCache.lines = lines;
-        return lines;
-      });
-    return apfixListCache.promise;
-  };
+  // ── NDS download helpers ──────────────────────────────────────────────────
+  // Cache per i lookup statici (code -> apfix name / discord filename)
+  const ndsMapCache: {
+    apfix: Record<string,string> | null;
+    discord: Record<string,string> | null;
+    discordList: Array<{filename:string; url:string}> | null;
+  } = { apfix: null, discord: null, discordList: null };
 
-  // Cache per dstdb_EN.txt (code -> EN title)
-  const enDbCache: { map: Record<string, string> | null; promise: Promise<Record<string, string>> | null } = { map: null, promise: null };
-  const fetchEnDb = async (): Promise<Record<string, string>> => {
-    if (enDbCache.map) return enDbCache.map;
-    if (enDbCache.promise) return enDbCache.promise;
-    enDbCache.promise = fetch('/dstdb_EN.txt')
-      .then(r => r.text())
-      .then(text => {
-        const map: Record<string, string> = {};
-        for (const raw of text.split('\n')) {
-          const line = raw.replace(/\r/g, '').trim();
-          if (!line || line.startsWith('TITLES')) continue;
-          const eq = line.indexOf('=');
-          if (eq !== -1) {
-            const code = line.substring(0, eq).trim();
-            const title = line.substring(eq + 1).trim();
-            map[code] = title;
-          }
-        }
-        enDbCache.map = map;
-        return map;
-      });
-    return enDbCache.promise;
-  };
-
-  // Regione preferita per ogni lettera del 4° carattere del codice NDS
-  const APFIX_REGION_PREF: Record<string, string[]> = {
-    E: ['(USA)', '(USA,'],
-    P: ['(Europe)', '(Europe,'],
-    I: ['(Italy)'],
-    J: ['(Japan)', '(Japan,'],
-    F: ['(France)', '(France,'],
-    S: ['(Spain)', '(Spain,'],
-    D: ['(Germany)', '(Germany,'],
-    K: ['(Korea)', '(Korea,'],
-    X: ['(Europe)', '(USA)'],
-  };
-  const APFIX_REGION_FALLBACK = ['(Europe)', '(USA)', '(World)', '(Japan)', '(Australia)'];
-
-  // Normalizza titolo per il confronto fuzzy
-  const normalizeApfixTitle = (s: string) => {
-    // Rimuove tutti i gruppi tra parentesi, poi strip tutto tranne alfanumerici
-    const bare = s.replace(/\s*\(.*?\)/g, '').trim();
-    return bare.toLowerCase().replace(/[:\-]/g, ' ').replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+  const fetchNdsMaps = async () => {
+    if (ndsMapCache.apfix && ndsMapCache.discord && ndsMapCache.discordList) return ndsMapCache;
+    const [apfixRes, discordMapRes, discordListRes] = await Promise.all([
+      fetch('/apfix_map.json').then(r => r.json()),
+      fetch('/discord_map.json').then(r => r.json()),
+      fetch('/listadiscord.txt').then(r => r.json()),
+    ]);
+    ndsMapCache.apfix = apfixRes as Record<string,string>;
+    ndsMapCache.discord = discordMapRes as Record<string,string>;
+    ndsMapCache.discordList = (discordListRes.attachments ?? []) as Array<{filename:string; url:string}>;
+    return ndsMapCache;
   };
 
   /**
-   * Dato un codice NDS (es. CLJP), cerca il file .nds corrispondente su archive.org/nds_apfix.
-   * Usa dstdb_EN per risolvere il titolo EN, poi fa fuzzy match su listaaaa.txt
-   * con preferenza per la regione del codice.
-   * Restituisce { data, name } dove name è il filename senza _apfix.
+   * Scarica il file .nds per il codice dato.
+   * Prima controlla apfix_map.json (archive.org), poi discord_map.json (Discord CDN).
+   * Usa un timeout di 45s per evitare hang infiniti.
    */
-  const fetchNdsFromApfix = async (code: string): Promise<{ data: Uint8Array; name: string } | null> => {
+  const fetchNdsFromApfix = async (code: string): Promise<{ data: Uint8Array; name: string; source: 'apfix' | 'discord' } | null> => {
+    const upperCode = code.toUpperCase();
     try {
-      const [list, enDb] = await Promise.all([fetchApfixList(), fetchEnDb()]);
+      const maps = await fetchNdsMaps();
 
-      // Titolo EN del gioco (il più compatibile con i nomi in listaaaa)
-      const enTitle = enDb[code.toUpperCase()] ?? '';
-      if (!enTitle) {
-        console.warn('apfix: codice non trovato in dstdb_EN:', code);
-        return null;
-      }
-
-      const normTitle = normalizeApfixTitle(enTitle);
-      const regionChar = code.length >= 4 ? code[3].toUpperCase() : 'P';
-      const preferred = APFIX_REGION_PREF[regionChar] ?? [];
-
-      // Raccoglie tutte le entry di listaaaa che corrispondono al titolo
-      const matches: string[] = [];
-      for (const line of list) {
-        const zipNameMatch = line.match(/^(.+?)_apfix\.zip/i);
-        if (!zipNameMatch) continue;
-        const fullName = zipNameMatch[1]; // es. "Mario & Luigi - Bowser's Inside Story (Europe)..."
-        const normApfix = normalizeApfixTitle(fullName);
-        if (
-          normApfix === normTitle ||
-          (normTitle.length > 5 && normApfix.includes(normTitle)) ||
-          (normApfix.length > 5 && normTitle.includes(normApfix))
-        ) {
-          matches.push(fullName);
+      // ── 1. Prova archive.org ──────────────────────────────────────────────
+      const apfixName = maps.apfix?.[upperCode];
+      if (apfixName) {
+        const zipName  = `${apfixName}_apfix.zip`;
+        const ndsName  = `${apfixName}_apfix.nds`;
+        const ndsUrl   = `https://archive.org/download/nds_apfix/apfix/${encodeURIComponent(zipName)}/${encodeURIComponent(ndsName)}`;
+        console.log('apfix: scarico', ndsUrl);
+        try {
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), 45_000);
+          const res = await fetch(ndsUrl, { signal: ctrl.signal });
+          clearTimeout(timer);
+          if (res.ok) {
+            const data = new Uint8Array(await res.arrayBuffer());
+            return { data, name: `${apfixName}.nds`, source: 'apfix' };
+          }
+          console.warn('apfix: HTTP', res.status);
+        } catch (e) {
+          console.warn('apfix: fetch error', e);
         }
       }
 
-      if (matches.length === 0) {
-        console.warn('apfix: nessun match per', code, '/', enTitle);
-        return null;
-      }
-
-      // Scegli il match con la regione preferita, altrimenti fallback
-      let bestMatch: string | null = null;
-      outer: for (const pref of [...preferred, ...APFIX_REGION_FALLBACK]) {
-        for (const m of matches) {
-          if (m.toLowerCase().includes(pref.toLowerCase())) {
-            bestMatch = m;
-            break outer;
+      // ── 2. Fallback: Discord CDN ──────────────────────────────────────────
+      const discordFilename = maps.discord?.[upperCode];
+      if (discordFilename && maps.discordList) {
+        const att = maps.discordList.find(a => a.filename === discordFilename);
+        if (att?.url) {
+          console.log('discord: scarico', att.url);
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 45_000);
+            const res = await fetch(att.url, { signal: ctrl.signal });
+            clearTimeout(timer);
+            if (res.ok) {
+              const data = new Uint8Array(await res.arrayBuffer());
+              // Nome pulito dal filename discord: "0022_-_Super_Mario_64_DS_Europe_EnFrDeEsIt.nds"
+              // -> "Super Mario 64 DS (Europe) (En,Fr,De,Es,It).nds" (usiamo il filename com'è, è già descrittivo)
+              const cleanName = discordFilename.replace(/^\d+_-_/, '').replace(/_/g, ' ').replace(/\.nds$/i, '') + '.nds';
+              return { data, name: cleanName, source: 'discord' };
+            }
+            console.warn('discord: HTTP', res.status, '(URL probabilmente scaduto)');
+          } catch (e) {
+            console.warn('discord: fetch error', e);
           }
         }
       }
-      if (!bestMatch) bestMatch = matches[0];
 
-      // Costruisce URL diretto al .nds dentro lo zip (senza scaricare lo zip intero)
-      const zipName = `${bestMatch}_apfix.zip`;
-      const ndsName = `${bestMatch}_apfix.nds`;
-      const ndsUrl = `https://archive.org/download/nds_apfix/apfix/${encodeURIComponent(zipName)}/${encodeURIComponent(ndsName)}`;
-
-      console.log('apfix: scarico', ndsUrl);
-      const res = await fetch(ndsUrl);
-      if (!res.ok) {
-        console.warn('apfix: HTTP', res.status, 'per', ndsUrl);
-        return null;
-      }
-
-      const data = new Uint8Array(await res.arrayBuffer());
-      // Nome finale senza _apfix (es. "Mario & Luigi - Bowser's Inside Story (Europe)...nds")
-      return { data, name: `${bestMatch}.nds` };
+      console.warn('nds: nessuna fonte disponibile per', upperCode);
+      return null;
     } catch (e) {
-      console.warn('apfix fetch failed for', code, e);
+      console.warn('fetchNdsFromApfix failed for', code, e);
       return null;
     }
   };
 
-    const processMultipleNdsFiles = async (files: File[]) => {
+      const processMultipleNdsFiles = async (files: File[]) => {
     setIsProcessing(true);
     setProcessingProgress({ current: 0, total: files.length });
     setErrorStatus(null);
@@ -543,7 +491,8 @@ export default function Home() {
                         name: artboxName,
                         gameCode: foundCode,
                         ndsData: ndsResult?.data,
-                        ndsName: ndsFileName
+                        ndsName: ndsFileName,
+                        ndsSource: ndsResult?.source
                     });
                     successCount++;
                 } else {
@@ -589,7 +538,8 @@ export default function Home() {
             name: artboxName,
             gameCode: code,
             ndsData: ndsResult?.data,
-            ndsName: ndsFileName
+            ndsName: ndsFileName,
+            ndsSource: ndsResult?.source
         }, ...prev]);
         setSearchQuery('');
       } else {
@@ -898,7 +848,7 @@ export default function Home() {
                     {/* Badge stato ROM da apfix */}
                     {item.gameCode && (
                       <div className={`mt-2 text-[10px] font-semibold px-2 py-0.5 rounded-full ${item.ndsData ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-zinc-100 text-zinc-400 dark:bg-zinc-700/50 dark:text-zinc-500'}`}>
-                        {item.ndsData ? `🎮 ${t.ndsFound}` : t.ndsNotFound}
+                        {item.ndsData ? `🎮 ${t.ndsFound}${item.ndsSource === 'discord' ? ' · Discord' : ' · Archive.org'}` : t.ndsNotFound}
                       </div>
                     )}
                     
