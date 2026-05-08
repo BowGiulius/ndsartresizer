@@ -300,6 +300,10 @@ export default function Home() {
       `https://art.gametdb.com/ds/cover/EN/${code}.jpg`,
       `https://art.gametdb.com/ds/coverM/EN/${code}.jpg`,
       `https://art.gametdb.com/ds/coverS/EN/${code}.png`,
+      // Fallback: usa il label (etichetta cartuccia) se nessuna copertina è disponibile
+      `https://art.gametdb.com/ds/label/${region}/${code}.png`,
+      `https://art.gametdb.com/ds/label/US/${code}.png`,
+      `https://art.gametdb.com/ds/label/EN/${code}.png`,
     ];
 
     for (const originalUrl of urlsToTry) {
@@ -315,82 +319,146 @@ export default function Home() {
     return null;
   };
 
-  // Cache per la lista apfix
+  // ── Apfix helpers ─────────────────────────────────────────────────────────
+  // Cache per listaaaa.txt (indice dei file su archive.org)
   const apfixListCache: { lines: string[] | null; promise: Promise<string[]> | null } = { lines: null, promise: null };
-
   const fetchApfixList = async (): Promise<string[]> => {
     if (apfixListCache.lines) return apfixListCache.lines;
     if (apfixListCache.promise) return apfixListCache.promise;
     apfixListCache.promise = fetch('/listaaaa.txt')
       .then(r => r.text())
       .then(text => {
-        const lines = text.split('\n').map((l: string) => l.replace(/\r/g, '').trim()).filter(Boolean);
+        const lines = text.split('\n')
+          .map((l: string) => l.replace(/\r/g, '').trim())
+          .filter((l: string) => l.includes('_apfix.zip'));
         apfixListCache.lines = lines;
         return lines;
       });
     return apfixListCache.promise;
   };
 
-  // Cerca e scarica il file .nds da archive.org/nds_apfix/apfix/ usando il nome del gioco
-  // Struttura: <Nome Gioco>_apfix.zip contiene <Nome Gioco>_apfix.nds
-  // Il .nds viene rinominato rimuovendo _apfix
-  const fetchNdsFromApfix = async (gameTitle: string): Promise<{ data: Uint8Array; name: string } | null> => {
+  // Cache per dstdb_EN.txt (code -> EN title)
+  const enDbCache: { map: Record<string, string> | null; promise: Promise<Record<string, string>> | null } = { map: null, promise: null };
+  const fetchEnDb = async (): Promise<Record<string, string>> => {
+    if (enDbCache.map) return enDbCache.map;
+    if (enDbCache.promise) return enDbCache.promise;
+    enDbCache.promise = fetch('/dstdb_EN.txt')
+      .then(r => r.text())
+      .then(text => {
+        const map: Record<string, string> = {};
+        for (const raw of text.split('\n')) {
+          const line = raw.replace(/\r/g, '').trim();
+          if (!line || line.startsWith('TITLES')) continue;
+          const eq = line.indexOf('=');
+          if (eq !== -1) {
+            const code = line.substring(0, eq).trim();
+            const title = line.substring(eq + 1).trim();
+            map[code] = title;
+          }
+        }
+        enDbCache.map = map;
+        return map;
+      });
+    return enDbCache.promise;
+  };
+
+  // Regione preferita per ogni lettera del 4° carattere del codice NDS
+  const APFIX_REGION_PREF: Record<string, string[]> = {
+    E: ['(USA)', '(USA,'],
+    P: ['(Europe)', '(Europe,'],
+    I: ['(Italy)'],
+    J: ['(Japan)', '(Japan,'],
+    F: ['(France)', '(France,'],
+    S: ['(Spain)', '(Spain,'],
+    D: ['(Germany)', '(Germany,'],
+    K: ['(Korea)', '(Korea,'],
+    X: ['(Europe)', '(USA)'],
+  };
+  const APFIX_REGION_FALLBACK = ['(Europe)', '(USA)', '(World)', '(Japan)', '(Australia)'];
+
+  // Normalizza titolo per il confronto fuzzy
+  const normalizeApfixTitle = (s: string) => {
+    // Rimuove tutti i gruppi tra parentesi, poi strip tutto tranne alfanumerici
+    const bare = s.replace(/\s*\(.*?\)/g, '').trim();
+    return bare.toLowerCase().replace(/[:\-]/g, ' ').replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+  };
+
+  /**
+   * Dato un codice NDS (es. CLJP), cerca il file .nds corrispondente su archive.org/nds_apfix.
+   * Usa dstdb_EN per risolvere il titolo EN, poi fa fuzzy match su listaaaa.txt
+   * con preferenza per la regione del codice.
+   * Restituisce { data, name } dove name è il filename senza _apfix.
+   */
+  const fetchNdsFromApfix = async (code: string): Promise<{ data: Uint8Array; name: string } | null> => {
     try {
-      const list = await fetchApfixList();
+      const [list, enDb] = await Promise.all([fetchApfixList(), fetchEnDb()]);
 
-      const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const normalizedInput = normalize(gameTitle);
+      // Titolo EN del gioco (il più compatibile con i nomi in listaaaa)
+      const enTitle = enDb[code.toUpperCase()] ?? '';
+      if (!enTitle) {
+        console.warn('apfix: codice non trovato in dstdb_EN:', code);
+        return null;
+      }
 
-      let bestMatch: string | null = null;
-      let bestScore = 0;
+      const normTitle = normalizeApfixTitle(enTitle);
+      const regionChar = code.length >= 4 ? code[3].toUpperCase() : 'P';
+      const preferred = APFIX_REGION_PREF[regionChar] ?? [];
 
+      // Raccoglie tutte le entry di listaaaa che corrispondono al titolo
+      const matches: string[] = [];
       for (const line of list) {
         const zipNameMatch = line.match(/^(.+?)_apfix\.zip/i);
         if (!zipNameMatch) continue;
-        const zipGameName = zipNameMatch[1];
-        const normalizedZip = normalize(zipGameName);
-
-        if (normalizedZip === normalizedInput) {
-          bestMatch = zipGameName;
-          break;
-        }
-        if (normalizedInput.length > 4 && normalizedZip.includes(normalizedInput)) {
-          const score = normalizedInput.length;
-          if (score > bestScore) { bestScore = score; bestMatch = zipGameName; }
-        }
-        if (normalizedZip.length > 4 && normalizedInput.includes(normalizedZip)) {
-          const score = normalizedZip.length;
-          if (score > bestScore) { bestScore = score; bestMatch = zipGameName; }
+        const fullName = zipNameMatch[1]; // es. "Mario & Luigi - Bowser's Inside Story (Europe)..."
+        const normApfix = normalizeApfixTitle(fullName);
+        if (
+          normApfix === normTitle ||
+          (normTitle.length > 5 && normApfix.includes(normTitle)) ||
+          (normApfix.length > 5 && normTitle.includes(normApfix))
+        ) {
+          matches.push(fullName);
         }
       }
 
-      if (!bestMatch) {
-        console.warn('apfix: nessun match trovato per', gameTitle);
+      if (matches.length === 0) {
+        console.warn('apfix: nessun match per', code, '/', enTitle);
         return null;
       }
 
-      const encodedZipName = encodeURIComponent(`${bestMatch}_apfix.zip`);
-      const encodedNdsName = encodeURIComponent(`${bestMatch}_apfix.nds`);
-      const ndsUrl = `https://archive.org/download/nds_apfix/apfix/${encodedZipName}/${encodedNdsName}`;
+      // Scegli il match con la regione preferita, altrimenti fallback
+      let bestMatch: string | null = null;
+      outer: for (const pref of [...preferred, ...APFIX_REGION_FALLBACK]) {
+        for (const m of matches) {
+          if (m.toLowerCase().includes(pref.toLowerCase())) {
+            bestMatch = m;
+            break outer;
+          }
+        }
+      }
+      if (!bestMatch) bestMatch = matches[0];
 
+      // Costruisce URL diretto al .nds dentro lo zip (senza scaricare lo zip intero)
+      const zipName = `${bestMatch}_apfix.zip`;
+      const ndsName = `${bestMatch}_apfix.nds`;
+      const ndsUrl = `https://archive.org/download/nds_apfix/apfix/${encodeURIComponent(zipName)}/${encodeURIComponent(ndsName)}`;
+
+      console.log('apfix: scarico', ndsUrl);
       const res = await fetch(ndsUrl);
       if (!res.ok) {
-        console.warn('apfix: download fallito', res.status, ndsUrl);
+        console.warn('apfix: HTTP', res.status, 'per', ndsUrl);
         return null;
       }
 
-      const arrayBuffer = await res.arrayBuffer();
-      const data = new Uint8Array(arrayBuffer);
-      // Nome finale senza _apfix
-      const cleanName = `${bestMatch}.nds`;
-      return { data, name: cleanName };
+      const data = new Uint8Array(await res.arrayBuffer());
+      // Nome finale senza _apfix (es. "Mario & Luigi - Bowser's Inside Story (Europe)...nds")
+      return { data, name: `${bestMatch}.nds` };
     } catch (e) {
-      console.warn('apfix fetch failed for', gameTitle, e);
+      console.warn('apfix fetch failed for', code, e);
       return null;
     }
   };
 
-  const processMultipleNdsFiles = async (files: File[]) => {
+    const processMultipleNdsFiles = async (files: File[]) => {
     setIsProcessing(true);
     setProcessingProgress({ current: 0, total: files.length });
     setErrorStatus(null);
@@ -463,7 +531,7 @@ export default function Home() {
             if (foundCode) {
                 const [dataUrl, ndsResult] = await Promise.all([
                     fetchBoxartFromWeserv(foundCode),
-                    fetchNdsFromApfix(baseName)
+                    fetchNdsFromApfix(foundCode)
                 ]);
                 if (dataUrl) {
                     // Il nome dell'artbox deve corrispondere al nome del .nds (senza _apfix)
@@ -510,7 +578,7 @@ export default function Home() {
     try {
       const [dataUrl, ndsResult] = await Promise.all([
         fetchBoxartFromWeserv(code),
-        fetchNdsFromApfix(customTitle || code)
+        fetchNdsFromApfix(code)
       ]);
       if (dataUrl) {
         const ndsFileName = ndsResult?.name ?? `${customTitle || code}.nds`;
@@ -740,6 +808,20 @@ export default function Home() {
                           const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalCoverUrl)}`;
                           const localCoverUrl = `/CoverDS/${game.id.toUpperCase()}.bmp`;
                           
+                          const gameRegion = getRegionFromId(game.id);
+                          const regionLabel: Record<string, string> = {
+                            US: 'US', EN: 'EU', IT: 'IT', FR: 'FR', ES: 'ES', DE: 'DE', JA: 'JA', KO: 'KO'
+                          };
+                          const regionColors: Record<string, string> = {
+                            US: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
+                            EN: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300',
+                            IT: 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300',
+                            FR: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300',
+                            ES: 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300',
+                            DE: 'bg-zinc-200 text-zinc-700 dark:bg-zinc-700 dark:text-zinc-200',
+                            JA: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+                            KO: 'bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300',
+                          };
                           return (
                           <li
                             key={i}
@@ -753,7 +835,10 @@ export default function Home() {
                               </div>
                               <span className={`font-medium break-words whitespace-normal leading-tight pr-2 ${theme === 'dark' ? 'text-zinc-200' : 'text-gray-800'}`}>{game.title}</span>
                             </div>
-                            <span className={`text-xs font-mono shrink-0 ${theme === 'dark' ? 'text-zinc-500 group-hover:text-blue-400' : 'text-gray-400 group-hover:text-blue-500'}`}>{game.id}</span>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${regionColors[gameRegion] ?? 'bg-zinc-100 text-zinc-500'}`}>{regionLabel[gameRegion] ?? gameRegion}</span>
+                              <span className={`text-xs font-mono ${theme === 'dark' ? 'text-zinc-500 group-hover:text-blue-400' : 'text-gray-400 group-hover:text-blue-500'}`}>{game.id}</span>
+                            </div>
                           </li>
                         )})}
                        </ul>
