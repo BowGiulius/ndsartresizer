@@ -783,7 +783,7 @@ export default function Home() {
                     {item.ndsData && item.ndsName && (
                       <button
                         onClick={() => {
-                          const blob = new Blob([item.ndsData!.buffer as ArrayBuffer], { type: 'application/octet-stream' });
+                          const blob = new Blob([item.ndsData!], { type: 'application/octet-stream' });
                           const url = URL.createObjectURL(blob);
                           const a = document.createElement('a');
                           a.href = url;
