@@ -1,5 +1,5 @@
 {
-  "name": "NDS Art Resizer",
+  "name": "Remix: NDS Art Resizer",
   "description": "Un sito per ridimensionare immagini a 128x115 adatte ai menu del Nintendo DS, con ricerca automatica della copertina caricando il file .NDS.",
   "requestFramePermissions": [],
   "majorCapabilities": []

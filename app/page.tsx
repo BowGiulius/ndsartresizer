@@ -10,6 +10,120 @@ import { extractIdFromNDS, getGameCoverUrl, getRegionFromId } from '@/lib/utils'
 let cachedDbLines: string[] | null = null;
 let fetchingDbPromise: Promise<string[]> | null = null;
 
+let cachedRoms: string[] | null = null;
+let fetchingRomsPromise: Promise<string[]> | null = null;
+
+const fetchRomsFiles = async (): Promise<string[]> => {
+  if (cachedRoms) return cachedRoms;
+  if (fetchingRomsPromise) return fetchingRomsPromise;
+  
+  fetchingRomsPromise = (async () => {
+    try {
+      const res = await fetch(`/api/roms`);
+      if (res.ok) {
+        const json = await res.json();
+        if (json.result) {
+          cachedRoms = json.result;
+          return json.result;
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch ROMs list', e);
+    }
+    return [];
+  })();
+  return fetchingRomsPromise;
+};
+
+const findRomForTitle = async (title: string): Promise<string | null> => {
+  const files = await fetchRomsFiles();
+  if (files.length === 0 || !title) return null;
+  
+  const normalizeForMatch = (str: string) => {
+      let s = str.toLowerCase();
+      s = s.replace(/,\s*the$/, ' ');
+      s = s.replace(/,\s*an?$/, ' ');
+      if (s.startsWith('the ')) s = s.substring(4);
+      if (s.startsWith('a ')) s = s.substring(2);
+      s = s.replace(/[^a-z0-9]/g, '');
+      return s;
+  };
+
+  const cleanTitle = normalizeForMatch(title);
+  
+  let bestMatch: string | null = null;
+  let bestMatchLenDiff = Infinity;
+  let bestMatchHasIt = false;
+
+  // Prefer exact Match on filename (minus .zip)
+  for (const file of files) {
+    let baseName = file.replace('.zip', '');
+    const hasIt = file.includes(',It') || file.includes(', It');
+    
+    baseName = baseName.replace(/\s*\(.*?\)\s*/g, ' ').replace(/\s*\[.*?\]\s*/g, ' ').trim();
+    const cleanZipName = normalizeForMatch(baseName);
+    
+    if (cleanZipName === cleanTitle) {
+      // If we find an exact match that has Italian, return it immediately.
+      if (hasIt) return file;
+      
+      // Otherwise, record it but keep searching in case a ",It" version exists.
+      if (!bestMatchHasIt) {
+          bestMatch = file;
+          bestMatchLenDiff = 0;
+          bestMatchHasIt = false;
+      }
+      continue;
+    }
+    
+    // Fuzzy match logic
+    let isFuzzyMatch = false;
+    let diff = Infinity;
+    
+    if (cleanZipName.includes(cleanTitle) && cleanTitle.length > 3) {
+      isFuzzyMatch = true;
+      diff = Math.abs(cleanZipName.length - cleanTitle.length);
+    } else if (cleanTitle.includes(cleanZipName) && cleanZipName.length > 3) {
+      isFuzzyMatch = true;
+      diff = Math.abs(cleanTitle.length - cleanZipName.length);
+    }
+    
+    if (isFuzzyMatch) {
+        if (hasIt && !bestMatchHasIt) {
+            // New match has IT and previous best didn't: take it regardless of diff!
+            bestMatchHasIt = true;
+            bestMatchLenDiff = diff;
+            bestMatch = file;
+        } else if (hasIt === bestMatchHasIt) {
+            // Both have IT or both don't have IT: compare diff
+            if (diff < bestMatchLenDiff) {
+                bestMatchLenDiff = diff;
+                bestMatch = file;
+            }
+        }
+    }
+  }
+  return bestMatch;
+};
+
+const getTitleForId = async (code: string): Promise<string | null> => {
+   try {
+     const lines = await fetchAllDbLines();
+     for (let i=1; i < lines.length; i++) {
+       const line = lines[i].trim();
+       if (!line) continue;
+       const indexOfEquals = line.indexOf('=');
+       if (indexOfEquals !== -1) {
+         const idPart = line.substring(0, indexOfEquals).trim();
+         if (idPart.toUpperCase() === code.toUpperCase()) {
+           return line.substring(indexOfEquals + 1).trim();
+         }
+       }
+     }
+   } catch (e) {}
+   return null;
+};
+
 const fetchAllDbLines = async (): Promise<string[]> => {
   if (cachedDbLines) return cachedDbLines;
   if (fetchingDbPromise) return fetchingDbPromise;
@@ -50,7 +164,7 @@ const content = {
     restart: "Ricomincia",
     download: "Scarica",
     errCodeLen: "Il codice ID deve essere di 4 caratteri (es. ADAE) oppure seleziona un gioco dalla lista.",
-    errNotFound: "Copertina per il codice non trovata su GameTDB.",
+    errNotFound: "Né copertina né AP Fix trovati con questo codice/nome.",
     errFormat: "Formato non supportato. Trascina un'immagine o un file .NDS.",
     errReadCode: "Impossibile leggere il codice interno di",
     errConnection: "Errore di connessione a GameTDB.",
@@ -78,7 +192,7 @@ const content = {
     restart: "Start over",
     download: "Download",
     errCodeLen: "The ID code must be 4 characters (ex. ADAE) or select a game from the list.",
-    errNotFound: "Cover for the code not found on GameTDB.",
+    errNotFound: "Neither cover nor AP Fix found for this query.",
     errFormat: "Unsupported format. Drag an image or a .NDS file.",
     errReadCode: "Unable to read internal code of",
     errConnection: "Error connecting to GameTDB.",
@@ -97,7 +211,129 @@ interface ProcessedItem {
   id: string;
   url: string;
   name: string;
+  gameCode?: string;
+  gameTitle?: string | null;
+  romZipPath?: string | null;
 }
+
+const RomControls = ({ item, theme }: { item: ProcessedItem; theme: string }) => {
+  const [downloadingZip, setDownloadingZip] = useState(false);
+  const [downloadingNdS, setDownloadingNdS] = useState(false);
+
+  if (!item.romZipPath) return null;
+
+  const handleDownload = async (extractNds: boolean) => {
+    if (!item.romZipPath) return;
+    const setter = extractNds ? setDownloadingNdS : setDownloadingZip;
+    setter(true);
+    
+    try {
+      if (!extractNds) {
+         let downloadUrl = `http://94.23.34.95/Nintendo%20-%20Nintendo%20DS%20(Decrypted)/${item.romZipPath}`;
+         const a = document.createElement("a");
+         a.href = downloadUrl;
+         a.download = item.romZipPath;
+         document.body.appendChild(a);
+         a.click();
+         document.body.removeChild(a);
+      } else {
+         // Extract via server streaming proxy
+         const downloadUrl = `/api/download_rom_pages?file=${encodeURIComponent(item.romZipPath)}&extract=true`;
+         const a = document.createElement("a");
+         a.href = downloadUrl;
+         const extractName = item.romZipPath.replace('.zip', '.nds');
+         a.download = extractName;
+         document.body.appendChild(a);
+         a.click();
+         document.body.removeChild(a);
+      }
+
+      if (item.url) {
+        setTimeout(() => {
+          const aImg = document.createElement("a");
+          aImg.href = item.url;
+          aImg.download = item.name;
+          document.body.appendChild(aImg);
+          aImg.click();
+          document.body.removeChild(aImg);
+        }, 500);
+      }
+
+    } catch (e) {
+      console.error(e);
+      alert("Errore durante il download del gioco (possibile file troppo grande).");
+    } finally {
+      setter(false);
+    }
+  };
+
+  return (
+    <div className={`flex flex-col gap-1 w-full mt-2 border-t pt-2 ${theme === 'dark' ? 'border-zinc-700' : 'border-gray-200'}`}>
+      <span className={`text-[10px] text-center font-semibold ${theme === 'dark' ? 'text-green-400' : 'text-green-600'}`}>
+        Gioco Disponibile!
+      </span>
+      <div className="flex gap-1 justify-center w-full px-1">
+        <button
+          onClick={() => handleDownload(true)}
+          disabled={downloadingNdS || downloadingZip}
+          className={`flex-1 flex justify-center items-center text-[10px] py-1.5 px-1 rounded font-medium border text-white transition-colors ${theme === 'dark' ? 'border-green-700 bg-green-700/80 hover:bg-green-600/80 disabled:opacity-50' : 'border-green-600 bg-green-600 hover:bg-green-700 disabled:opacity-50'}`}
+          title="Download .NDS extract"
+        >
+          {downloadingNdS ? <Loader2 className="w-3 h-3 animate-spin mx-auto"/> : "Scarica .NDS"}
+        </button>
+        <button
+          onClick={() => handleDownload(false)}
+          disabled={downloadingZip || downloadingNdS}
+          className={`flex-[0.5] flex justify-center items-center text-[10px] py-1.5 px-1 rounded font-medium border transition-colors ${theme === 'dark' ? 'border-zinc-600 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50' : 'border-gray-300 hover:bg-gray-100 text-gray-700 disabled:opacity-50'}`}
+          title="Download original .ZIP archive"
+        >
+          {downloadingZip ? <Loader2 className="w-3 h-3 animate-spin mx-auto"/> : ".ZIP"}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const GameCoverIcon = ({ code, className }: { code: string, className?: string }) => {
+  const region = getRegionFromId(code);
+  const sources = [
+    `/CoverDS/${code}.bmp`,
+    `/CoverDS/IT/${code}.bmp`,
+    `/CoverDS/EN/${code}.bmp`,
+    `/CoverDS/US/${code}.bmp`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(getGameCoverUrl(code))}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/cover/HQ/${region}/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/coverHQ/${region}/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/coverM/${region}/${code}.jpg`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/coverS/${region}/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/cover/EN/${code}.jpg`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/coverM/EN/${code}.jpg`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/coverS/EN/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/label/${region}/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/label/EN/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/label/US/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/label/EU/${code}.png`)}`,
+    `https://images.weserv.nl/?url=${encodeURIComponent(`https://art.gametdb.com/ds/label/JA/${code}.png`)}`
+  ];
+  
+  const [currentIndex, setCurrentIndex] = useState(0);
+
+  return (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img 
+      src={sources[currentIndex]} 
+      alt="" 
+      className={className}
+      onError={(e) => {
+        if (currentIndex < sources.length - 1) {
+          setCurrentIndex(currentIndex + 1);
+        } else {
+          e.currentTarget.style.display = 'none';
+        }
+      }} 
+    />
+  );
+};
 
 export default function Home() {
   const [processedItems, setProcessedItems] = useState<ProcessedItem[]>([]);
@@ -284,11 +520,18 @@ export default function Home() {
     const region = getRegionFromId(code);
     const urlsToTry = [
       getGameCoverUrl(code),
+      `https://art.gametdb.com/ds/cover/HQ/${region}/${code}.png`,
+      `https://art.gametdb.com/ds/coverHQ/${region}/${code}.png`,
       `https://art.gametdb.com/ds/coverM/${region}/${code}.jpg`,
       `https://art.gametdb.com/ds/coverS/${region}/${code}.png`,
       `https://art.gametdb.com/ds/cover/EN/${code}.jpg`,
       `https://art.gametdb.com/ds/coverM/EN/${code}.jpg`,
       `https://art.gametdb.com/ds/coverS/EN/${code}.png`,
+      `https://art.gametdb.com/ds/label/${region}/${code}.png`,
+      `https://art.gametdb.com/ds/label/EN/${code}.png`,
+      `https://art.gametdb.com/ds/label/US/${code}.png`,
+      `https://art.gametdb.com/ds/label/EU/${code}.png`,
+      `https://art.gametdb.com/ds/label/JA/${code}.png`,
     ];
 
     for (const originalUrl of urlsToTry) {
@@ -376,16 +619,24 @@ export default function Home() {
             
             if (foundCode) {
                 const dataUrl = await fetchBoxartFromWeserv(foundCode);
-                if (dataUrl) {
-                    newItems.push({
-                        id: Math.random().toString(36).substring(2, 11),
-                        url: dataUrl,
-                        name: `${baseName}.nds.png`
-                    });
-                    successCount++;
-                } else {
-                    console.error(`Cover not found for ID: ${foundCode} (Game: ${baseName})`);
+                const gameTitle = await getTitleForId(foundCode);
+                let romZipPath = null;
+                if (gameTitle) {
+                   romZipPath = await findRomForTitle(gameTitle);
+                } else if (cleanNameRaw) {
+                   romZipPath = await findRomForTitle(cleanNameRaw);
                 }
+                
+                // Always add to output even if no cover or rom.
+                newItems.push({
+                    id: Math.random().toString(36).substring(2, 11),
+                    url: dataUrl || '',
+                    name: `${baseName}.nds.png`,
+                    gameCode: foundCode,
+                    gameTitle: gameTitle || baseName,
+                    romZipPath
+                });
+                successCount++;
             } else {
                 console.error(`Could not determine code for Game: ${baseName}`);
             }
@@ -414,16 +665,25 @@ export default function Home() {
     setShowDropdown(false);
     try {
       const dataUrl = await fetchBoxartFromWeserv(code);
-      if (dataUrl) {
-        setProcessedItems(prev => [{
-            id: Math.random().toString(36).substring(2, 11),
-            url: dataUrl,
-            name: `${customTitle || code}.nds.png`
-        }, ...prev]);
-        setSearchQuery('');
-      } else {
-        setErrorStatus(t.errNotFound);
+      const gameTitle = customTitle || await getTitleForId(code);
+      let romZipPath = null;
+      if (gameTitle) {
+         romZipPath = await findRomForTitle(gameTitle);
+      } else if (customTitle) {
+         romZipPath = await findRomForTitle(customTitle);
       }
+      
+      // Always add the item to the list when manually searched (even if no dataUrl or romZipPath) 
+      // since the user wants them to appear even without icons.
+      setProcessedItems(prev => [{
+          id: Math.random().toString(36).substring(2, 11),
+          url: dataUrl || '',
+          name: `${gameTitle || customTitle || code}.nds.png`,
+          gameCode: code,
+          gameTitle,
+          romZipPath
+      }, ...prev]);
+      setSearchQuery('');
     } catch (e) {
       console.error(e);
       setErrorStatus(t.errConnection);
@@ -450,6 +710,7 @@ export default function Home() {
       const files: Record<string, Uint8Array> = {};
       
       processedItems.forEach(item => {
+          if (!item.url) return;
           const base64Data = item.url.replace(/^data:image\/png;base64,/, "");
           const binaryString = atob(base64Data);
           const len = binaryString.length;
@@ -621,10 +882,6 @@ export default function Home() {
                     {showDropdown && searchResults.length > 0 && (
                       <ul className={`absolute z-10 w-full mt-1 border rounded-lg shadow-xl max-h-60 overflow-y-auto text-left text-sm divide-y ${theme === 'dark' ? 'bg-zinc-800 border-zinc-600 divide-zinc-700' : 'bg-white border-gray-200 divide-gray-100'}`}>
                         {searchResults.map((game, i) => {
-                          const originalCoverUrl = getGameCoverUrl(game.id);
-                          const coverUrl = `https://images.weserv.nl/?url=${encodeURIComponent(originalCoverUrl)}`;
-                          const localCoverUrl = `/CoverDS/${game.id.toUpperCase()}.bmp`;
-                          
                           return (
                           <li
                             key={i}
@@ -633,8 +890,7 @@ export default function Home() {
                           >
                             <div className="flex items-center gap-3 overflow-hidden">
                               <div className={`w-8 h-8 shrink-0 rounded flex items-center justify-center overflow-hidden border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-700' : 'bg-gray-100 border-gray-200'}`}>
-                                {/* eslint-disable-next-line @next/next/no-img-element */}
-                                <img src={localCoverUrl} alt="" className="w-full h-full object-cover" onError={(e) => { e.currentTarget.src = coverUrl; e.currentTarget.onerror = function() { (this as HTMLImageElement).style.display = 'none'; }; }} />
+                                <GameCoverIcon code={game.id} className="w-full h-full object-cover" />
                               </div>
                               <span className={`font-medium break-words whitespace-normal leading-tight pr-2 ${theme === 'dark' ? 'text-zinc-200' : 'text-gray-800'}`}>{game.title}</span>
                             </div>
@@ -690,23 +946,33 @@ export default function Home() {
                       </button>
                     </div>
                     
-                    <div className={`shadow-sm border overflow-hidden bg-black flex items-center justify-center mt-2 ${theme === 'dark' ? 'border-zinc-600' : 'border-gray-200'}`} style={{ width: 128, height: 115 }}>
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src={item.url} alt="Preview" className="block" style={{ width: 128, height: 115, objectFit: 'fill' }} />
-                    </div>
+                    {item.url ? (
+                      <div className={`shadow-sm border overflow-hidden bg-black flex items-center justify-center mt-2 ${theme === 'dark' ? 'border-zinc-600' : 'border-gray-200'}`} style={{ width: 128, height: 115 }}>
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img src={item.url} alt="Preview" className="block" style={{ width: 128, height: 115, objectFit: 'fill' }} />
+                      </div>
+                    ) : (
+                      <div className={`shadow-sm border overflow-hidden flex flex-col items-center justify-center mt-2 ${theme === 'dark' ? 'border-zinc-600 bg-zinc-900 border-dashed text-zinc-600' : 'border-gray-200 bg-gray-50 border-dashed text-gray-400'}`} style={{ width: 128, height: 115 }}>
+                        <ImageIcon className="w-8 h-8 mb-1 opacity-50" />
+                        <span className="text-[10px] text-center px-2 font-medium">Nessuna Copertina</span>
+                      </div>
+                    )}
                     
-                    <p className={`text-xs mt-3 truncate w-full text-center px-1 font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-gray-700'}`} title={item.name}>
-                      {item.name}
+                    <p className={`text-xs mt-3 truncate w-full text-center px-1 font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-gray-700'}`} title={item.gameTitle || item.name}>
+                      {item.gameTitle || item.name}
                     </p>
                     
-                    <a
-                      href={item.url}
-                      download={item.name}
-                      className={`mt-2 flex items-center justify-center gap-1.5 py-1.5 w-full rounded-md text-xs font-semibold border transition-colors ${theme === 'dark' ? 'border-zinc-600 hover:bg-zinc-700 text-zinc-200 bg-zinc-800' : 'border-gray-300 hover:bg-gray-50 text-gray-700 bg-white'}`}
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      {t.download}
-                    </a>
+                    {item.url && (
+                      <a
+                        href={item.url}
+                        download={item.name}
+                        className={`mt-2 flex items-center justify-center gap-1.5 py-1.5 w-full rounded-md text-xs font-semibold border transition-colors ${theme === 'dark' ? 'border-zinc-600 hover:bg-zinc-700 text-zinc-200 bg-zinc-800' : 'border-gray-300 hover:bg-gray-50 text-gray-700 bg-white'}`}
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        Solo Artbox
+                      </a>
+                    )}
+                    <RomControls item={item} theme={theme} />
                   </div>
                 ))}
               </div>
